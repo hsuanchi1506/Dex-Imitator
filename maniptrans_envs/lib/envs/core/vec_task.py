@@ -149,6 +149,15 @@ class Env(ABC):
                     ),
                 }
             )
+        obs_space.update(
+            {
+                "extra": spaces.Box(
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(216,),
+                ),
+            }
+        )
         self.obs_space = spaces.Dict(obs_space)
 
         self.num_actions = config["env"]["numActions"]
@@ -315,7 +324,7 @@ class VecTask(Env):
         for env_id in range(self.num_envs):
             self.extern_actor_params[env_id] = None
 
-        # self.camera_handlers = [] if (display or record) else None
+        self.camera_handlers = [] if (display or record) else None
         self.camera_obs = [] if (display or record) else None
 
         # create envs, sim and viewer
@@ -406,6 +415,15 @@ class VecTask(Env):
                 {
                     "privileged": torch.zeros(
                         (self.num_envs, self.privileged_obs_dim),
+                        device=self.device,
+                        dtype=torch.float,
+                    ),
+                }
+            )
+        self.obs_dict.update(
+                {
+                    "extra": torch.zeros(
+                        (self.num_envs, 216),
                         device=self.device,
                         dtype=torch.float,
                     ),
@@ -519,6 +537,8 @@ class VecTask(Env):
             # asymmetric actor-critic
             if self.num_states > 0:
                 self.obs_dict["states"] = self.get_state()
+
+        # import ipdb; ipdb.set_trace()
 
         return (
             self.obs_dict,

@@ -41,6 +41,9 @@ params:
         target:
           _target_: lib.nn.features.Identity
           input_dim: ${is_united_model:${.......bimanual_mode},${.......side},${eval:'${.....base_target_dim}+3+3+3+4+4+3+3+${nbody:${.....dexhand}}+5+128'}}
+        extra:
+          _target_: lib.nn.features.Identity
+          input_dim: ${eval:'216'}
       hidden_depth: 3
       hidden_dim: 512
       output_dim: 256

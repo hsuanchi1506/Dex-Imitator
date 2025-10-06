@@ -71,7 +71,12 @@ class ModelA2CContinuousLogStdResRH(BaseModel):
         def forward(self, input_dict):
             is_train = input_dict.get("is_train", True)
             prev_actions = input_dict.get("prev_actions", None)
-            base_model_obs = {k: deepcopy(v[:, : self.base_model_obs_shape[k]]) for k, v in input_dict["obs"].items()}
+            # base_model_obs = {k: deepcopy(v[:, : self.base_model_obs_shape[k]]) for k, v in input_dict["obs"].items()}
+            base_model_obs = {
+                k: deepcopy(v[:, : self.base_model_obs_shape[k]])
+                for k, v in input_dict["obs"].items()
+                if k != "extra"
+            }
             base_model_obs = self.base_model.norm_obs(base_model_obs)
             input_dict["obs"] = self.norm_obs(input_dict["obs"])
             mu, logstd, value, states, base_action = self.a2c_network(
@@ -175,7 +180,12 @@ class ModelA2CContinuousLogStdResLH(BaseModel):
         def forward(self, input_dict):
             is_train = input_dict.get("is_train", True)
             prev_actions = input_dict.get("prev_actions", None)
-            base_model_obs = {k: deepcopy(v[:, : self.base_model_obs_shape[k]]) for k, v in input_dict["obs"].items()}
+            # base_model_obs = {k: deepcopy(v[:, : self.base_model_obs_shape[k]]) for k, v in input_dict["obs"].items()}
+            base_model_obs = {
+                k: deepcopy(v[:, : self.base_model_obs_shape[k]])
+                for k, v in input_dict["obs"].items()
+                if k != "extra"
+            }
             base_model_obs = self.base_model.norm_obs(base_model_obs)
             input_dict["obs"] = self.norm_obs(input_dict["obs"])
             mu, logstd, value, states, base_action = self.a2c_network(
@@ -294,12 +304,12 @@ class ModelA2CContinuousLogStdResBiH(BaseModel):
             is_train = input_dict.get("is_train", True)
             prev_actions = input_dict.get("prev_actions", None)
             rh_base_model_obs = {
-                k: deepcopy(v[:, : self.base_model_obs_shape[k]]) for k, v in input_dict["obs"].items()
+                k: deepcopy(v[:, : self.base_model_obs_shape[k]]) for k, v in input_dict["obs"].items() if k != "extra"
             }
             rh_base_model_obs = self.rh_base_model.norm_obs(rh_base_model_obs)
             lh_base_model_obs = {
                 k: deepcopy(v[:, v.shape[1] // 2 : v.shape[1] // 2 + self.base_model_obs_shape[k]])
-                for k, v in input_dict["obs"].items()
+                for k, v in input_dict["obs"].items() if k != "extra"
             }
             lh_base_model_obs = self.lh_base_model.norm_obs(lh_base_model_obs)
             input_dict["obs"] = self.norm_obs(input_dict["obs"])

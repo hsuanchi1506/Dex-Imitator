@@ -214,7 +214,7 @@ class DexHandManipBiHEnv(VecTask):
         # Refresh tensors
         self._refresh()
 
-    def _debug_dump_seg_stats(self, max_envs: int = 4):
+    def _debug_dump_seg_stats(self, max_envs: int = 1024):
         if not hasattr(self, "last_segs") or self.last_segs is None:
             print("[seg] no seg tensors")
             return
@@ -229,7 +229,7 @@ class DexHandManipBiHEnv(VecTask):
         self,
         out_dir: str,
         step: int,
-        max_envs: int = 4,
+        max_envs: int = 1024,
         gamma: float = 0.6,
 
         # Windowing controls (same as before)
@@ -562,7 +562,7 @@ class DexHandManipBiHEnv(VecTask):
         return rgb_images
 
 
-    def _save_depth_16bit_png(self, out_dir: str, step: int, max_envs: int = 4, scale: float = 1000.0):
+    def _save_depth_16bit_png(self, out_dir: str, step: int, max_envs: int = 1024, scale: float = 1000.0):
         """
         Save 16-bit grayscale PNG (store in integer millimeters; background=0). Read back with: depth_m = image_uint16.astype(np.float32) / scale
         """
@@ -690,7 +690,7 @@ class DexHandManipBiHEnv(VecTask):
         
         return points_3d
 
-    def _save_object_pointcloud_png(self, out_dir: str, step: int, max_envs: int = 4, 
+    def _save_object_pointcloud_png(self, out_dir: str, step: int, max_envs: int = 1024, 
                                method="simple",  # "simple" or "world_coord"
                                views: tuple = ((20, -60),)):
         """
@@ -752,7 +752,7 @@ class DexHandManipBiHEnv(VecTask):
                 zlim=(0.5, 1.3)
             )
 
-    def _save_colored_object_pointcloud_png(self, out_dir: str, step: int, max_envs: int = 4, 
+    def _save_colored_object_pointcloud_png(self, out_dir: str, step: int, max_envs: int = 1024, 
                                        views: tuple = ((20, -60),)):
         """
         Save colored object point cloud visualization
@@ -807,7 +807,7 @@ class DexHandManipBiHEnv(VecTask):
                 points_3d, colors, out_path, views
             )
 
-    def _save_no_rgb_object_pointcloud_png(self, out_dir: str, step: int, max_envs: int = 4, 
+    def _save_no_rgb_object_pointcloud_png(self, out_dir: str, step: int, max_envs: int = 1024, 
                                      views: tuple = ((20, -60),),
                                      color_method: str = 'depth'):
         """
@@ -1967,7 +1967,7 @@ class DexHandManipBiHEnv(VecTask):
         self.total_rew_buf += rew_buf
         return rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf
 
-    def _save_segmentation_quick(self, out_dir: str, step: int, max_envs: int = 4):
+    def _save_segmentation_quick(self, out_dir: str, step: int, max_envs: int = 1024):
         """
         Will output two files:
         - seg_color_envXX_stepXXXXXX.png : preview image that maps actor id to color
@@ -2038,27 +2038,34 @@ class DexHandManipBiHEnv(VecTask):
                 print("depth has no finite values")
             self._printed_depth_info = True
 
-        # === Save every 50 steps (adjustable) ===
-        step = int(self.gym.get_frame_count(self.sim))
-        if (step % 10) == 0 and self.last_depths is not None:
-            out_dir = "depth_debug"  # your desired output folder
-            out_dir = "depth_debug"  # your desired output folder
-            # Save color preview
-            self._save_depth_preview_png(out_dir, step, max_envs=4)
-            # Also save 16-bit depth (optional)
-            self._save_depth_16bit_png(out_dir, step, max_envs=4, scale=1000.0)  # millimeters
-            # ★ New: save point cloud visualization
-            self._save_no_rgb_object_pointcloud_png(
-                out_dir, step, max_envs=4,
-                views=((20, -60),),
-                color_method='depth'  # or 'height', 'uniform', 'distance', 'coordinate'
-            )
-            self._find_contacts_and_save_cam(
-                out_dir, step, max_envs=4,
+        self.save_contacts(
+                out_dir, step, max_envs=1024,
                 object_depth_range=(0.6, 1.2),
                 center_crop_ratio=0.6,
-                shade="cam_depth"   # or "height"
+                shade="cam_depth"  
             )
+
+        # # === Save every 50 steps (adjustable) ===
+        # step = int(self.gym.get_frame_count(self.sim))
+        # if (step % 10) == 0 and self.last_depths is not None:
+        #     out_dir = "depth_debug"  # your desired output folder
+        #     out_dir = "depth_debug"  # your desired output folder
+        #     # Save color preview
+        #     self._save_depth_preview_png(out_dir, step, max_envs=1024)
+        #     # Also save 16-bit depth (optional)
+        #     self._save_depth_16bit_png(out_dir, step, max_envs=1024, scale=1000.0)  # millimeters
+        #     # ★ New: save point cloud visualization
+        #     self._save_no_rgb_object_pointcloud_png(
+        #         out_dir, step, max_envs=1024,
+        #         views=((20, -60),),
+        #         color_method='depth'  # or 'height', 'uniform', 'distance', 'coordinate'
+        #     )
+        #     self._find_contacts_and_save_cam(
+        #         out_dir, step, max_envs=1024,
+        #         object_depth_range=(0.6, 1.2),
+        #         center_crop_ratio=0.6,
+        #         shade="cam_depth"   # or "height"
+        #     )
 
 
 
@@ -2437,7 +2444,7 @@ class DexHandManipBiHEnv(VecTask):
 
 
 
-    def _find_contacts_and_save_cam(self, out_dir: str, step: int, max_envs: int = 4,
+    def _find_contacts_and_save_cam(self, out_dir: str, step: int, max_envs: int = 1024,
                                 object_depth_range=(0.6, 1.2),
                                 center_crop_ratio=0.6,
                                 shade: str = "cam_depth",
@@ -2515,6 +2522,94 @@ class DexHandManipBiHEnv(VecTask):
 
 
             print(f"[contacts/cam] env {env_id}: RH/LH contacts(<{contact_thresh:.3f}m")
+
+
+    def save_contacts(self, out_dir: str, step: int, max_envs: int = 1024,
+                                object_depth_range=(0.6, 1.2),
+                                center_crop_ratio=0.6,
+                                shade: str = "cam_depth",
+                                contact_thresh: float = 0.01):
+        import os
+        os.makedirs(out_dir, exist_ok=True)
+        if self.last_depths is None:
+            return
+
+
+        # todo: its only works for env_id = 0
+        num = min(len(self.last_depths), max_envs)
+        for env_id in range(num):
+            depth_tensor = self.last_depths[env_id]
+            if depth_tensor is None:
+                continue
+
+            seg_tensor = self.last_segs[env_id]
+            allowed_ids = self._get_allowed_object_ids_for_env(env_id)
+            pc_cam = self._depth_to_pointcloud_from_seg(
+                depth_tensor=depth_tensor,
+                seg_tensor=seg_tensor,
+                allowed_ids=allowed_ids,
+                horizontal_fov_deg=69.4,
+                max_points=200000,
+                border_dilate_px=1,
+                z_min=0.45,     # ← adjust according to the distance between your camera and the table
+                z_max=1.30      # ← avoid capturing far background (the yellow block will not appear
+            )
+            if pc_cam is None or pc_cam.shape[0] == 0:
+                print(f"[contacts/cam] env {env_id}: no OBJECT point cloud (seg-mask empty).")
+                continue
+
+            # === joints world → camera (this time include the base in order to connect to the palm)
+            rh_world_all = self.rh_states["joints_state"][env_id, :, :3]   # [18,3]
+            lh_world_all = self.lh_states["joints_state"][env_id, :, :3]
+            rh_cam_all = self._world_to_camera(rh_world_all, env_id)
+            lh_cam_all = self._world_to_camera(lh_world_all, env_id)
+
+            
+
+            # In your original nearest-neighbor computation you dropped the base; keep it that way (compute contacts using only movable joints)
+            rh_world = rh_world_all[1:, :]
+            lh_world = lh_world_all[1:, :]
+            rh_cam = self._world_to_camera(rh_world, env_id)
+            lh_cam = self._world_to_camera(lh_world, env_id)
+
+            # Nearest neighbors
+            _, rh_cpts_cam_all, rh_d_all = self._nn_contacts_for_hand_cam(rh_cam, pc_cam)
+            _, lh_cpts_cam_all, lh_d_all = self._nn_contacts_for_hand_cam(lh_cam, pc_cam)
+
+            # Keep only contacts with distance < 0.01 m
+            contact_thresh = 0.01  # your intended threshold
+            rh_mask = rh_d_all < contact_thresh
+            lh_mask = lh_d_all < contact_thresh
+            rh_cam_vis = rh_cam[rh_mask]
+            rh_cpts_cam = rh_cpts_cam_all[rh_mask]
+            lh_cam_vis = lh_cam[lh_mask]
+            lh_cpts_cam = lh_cpts_cam_all[lh_mask]
+
+
+            import torch
+
+            rh_joints = rh_cam_all            
+            lh_joints = lh_cam_all           
+
+            rh_contacts = torch.zeros_like(rh_joints)  
+            lh_contacts = torch.zeros_like(lh_joints)  
+
+            rh_contacts[1:][rh_mask] = rh_cpts_cam_all[rh_mask]
+            lh_contacts[1:][lh_mask] = lh_cpts_cam_all[lh_mask]
+
+            vec = torch.cat([
+                lh_joints.reshape(-1),       
+                rh_joints.reshape(-1),       
+                lh_contacts.reshape(-1),     
+                rh_contacts.reshape(-1),     
+            ], dim=0).unsqueeze(0) 
+
+            vec216 = vec.squeeze(0).to(dtype=torch.float32, device=rh_joints.device)  # (216,)
+
+            if env_id == 0 or ("extra" not in self.obs_dict) or (self.obs_dict["extra"].shape[0] != num):
+                self.obs_dict["extra"] = torch.zeros((num, 216), device=rh_joints.device, dtype=torch.float32)
+
+            self.obs_dict["extra"][env_id].copy_(vec216)
 
 
 
@@ -2899,6 +2994,7 @@ class DexHandManipBiHEnv(VecTask):
             ],
             dim=-1,
         )
+        # self.obs_dict["extra"] = torch.zeros((1, 216), device="cuda", dtype=torch.float32)
 
         if not self.training:
             manip_obj_root_state = getattr(self, f"_manip_obj_{side}_root_state")
@@ -3386,7 +3482,7 @@ class DexHandManipBiHEnv(VecTask):
         self.gym.set_dof_position_target_tensor(self.sim, gymtorch.unwrap_tensor(self._pos_control))
 
     def post_physics_step(self):
-
+        # import ipdb; ipdb.set_trace()
         self.compute_observations()
         self.compute_reward(self.actions)
 
