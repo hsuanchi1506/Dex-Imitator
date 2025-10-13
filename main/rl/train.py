@@ -160,7 +160,6 @@ def launch_rlg_hydra(cfg: DictConfig):
             kwargs["headless"] = cfg.headless
             kwargs["has_headless_arg"] = True
         envs = maniptrans_envs.lib.make(**kwargs)
-        # import ipdb; ipdb.set_trace()
         if cfg.capture_video:
             envs.is_vector_env = True
             envs = WandbVideoCaptureWrapper(
@@ -230,7 +229,6 @@ def launch_rlg_hydra(cfg: DictConfig):
     os.makedirs(experiment_dir, exist_ok=True)
     with open(os.path.join(experiment_dir, "config.yaml"), "w") as f:
         f.write(OmegaConf.to_yaml(cfg))
-
     runner.run(
         {
             "train": not cfg.test,

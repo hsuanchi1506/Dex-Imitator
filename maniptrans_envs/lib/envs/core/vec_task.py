@@ -154,7 +154,7 @@ class Env(ABC):
                 "extra": spaces.Box(
                     low=-np.inf,
                     high=np.inf,
-                    shape=(216,),
+                    shape=(168,),
                 ),
             }
         )
@@ -423,7 +423,7 @@ class VecTask(Env):
         self.obs_dict.update(
                 {
                     "extra": torch.zeros(
-                        (self.num_envs, 216),
+                        (self.num_envs, 168),
                         device=self.device,
                         dtype=torch.float,
                     ),

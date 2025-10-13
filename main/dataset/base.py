@@ -430,6 +430,28 @@ class ManipData(Dataset, ABC):
         nearest_pts = obj_verts_transf.gather(1, nearest_idx[..., None].expand(-1, -1, 3))
         rel_vec = nearest_pts - joints_all  # (T, J, 3)
 
+        # === Contact point detection ===
+        # Compute distance per joint to nearest surface point
+        joint_to_pc_dist = torch.norm(rel_vec, dim=-1)  # (T, J)
+        contact_thresh = 0.05  # 5 cm threshold
+
+        # Boolean mask where each joint is in contact at each frame
+        contact_mask = joint_to_pc_dist < contact_thresh  # (T, J)
+
+        # Fill a tensor with NaN for non-contact joints (optional, easier visualization)
+        contact_points = torch.full_like(nearest_pts, float('nan'))  # (T, J, 3)
+        contact_points[contact_mask] = nearest_pts[contact_mask]     # keep only contacts
+
+        # Store results
+        data["joint_to_pc_dist"] = joint_to_pc_dist  # (T, J)
+        data["contact_mask"] = contact_mask          # (T, J)
+        data["contact_point"] = contact_points       # (T, J, 3)
+
+        tip_indices = [19, 3, 7, 15, 11]
+        contact_points_tips = contact_points[:, tip_indices, :]  # shape: [T, 5, 3]
+        data["contact_point_tips"] = contact_points_tips
+
+
         data["joints_all_names"] = joint_names_sorted
         data["joints_all"] = joints_all
         data["nearest_pc_idx"] = nearest_idx
