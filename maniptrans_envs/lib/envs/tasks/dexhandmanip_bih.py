@@ -5,7 +5,7 @@ import random
 from enum import Enum
 from itertools import cycle
 from time import time
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import torch
@@ -43,6 +43,21 @@ import matplotlib.pyplot as plt
 def soft_clamp(x, lower, upper):
     return lower + torch.sigmoid(4 / (upper - lower) * (x - (lower + upper) / 2)) * (upper - lower)
 
+def _save_single_rgb(rgb_tensor, path: str):
+    """把 Isaac Gym 取回的 COLOR tensor 存成 PNG。"""
+    from PIL import Image
+    rgb = rgb_tensor.detach().cpu()
+    # 轉成 (H,W,3) uint8
+    if rgb.ndim == 3 and rgb.shape[-1] == 4:      # (H,W,4)
+        rgb = rgb[..., :3]
+    elif rgb.ndim == 3 and rgb.shape[0] == 4:     # (4,H,W)
+        rgb = rgb.permute(1, 2, 0)[..., :3]
+    if rgb.dtype != torch.uint8:
+        rgb = rgb.clamp(0, 255).to(torch.uint8)
+    Image.fromarray(rgb.numpy(), mode="RGB").save(path)
+
+
+
 
 class DexHandManipBiHEnv(VecTask):
 
@@ -60,9 +75,28 @@ class DexHandManipBiHEnv(VecTask):
         self._record = record
         self.cfg = cfg
 
+        self.debug = False
+
         self.camera_handlers = []   # Trigger _create_envs() to build camera branches
         self.cameras = []           # Store the camera handle for each env
         self.last_depths = None     # Store the most recent depth (list of HxW tensors)
+
+
+
+        self.cameras_top = []       # top-down camera，每個 env 一支
+        self.last_depths = None     # front depth (HxW tensors)
+        self.last_segs = None       # front seg
+        self.last_rgb_images = None # front rgb
+
+        # 新增 top 的快取
+        self.last_depths_top = None
+        self.last_segs_top = None
+        self.last_rgb_images_top = None
+
+        # Calibration switches for per-env camera extrinsics: whether to add env origin
+        # Keys: view -> env_id -> Optional[bool]; True means add origin, False means not
+        self._cam_origin_mode: Dict[str, Dict[int, Optional[bool]]] = {"front": {}, "top": {}}
+        self._cam_origin_mode_printed: Dict[str, Dict[int, bool]] = {"front": {}, "top": {}}
 
         use_quat_rot = self.use_quat_rot = self.cfg["env"]["useQuatRot"]
         self.max_episode_length = self.cfg["env"]["episodeLength"]
@@ -311,6 +345,9 @@ class DexHandManipBiHEnv(VecTask):
             return n.astype(np.float32)
 
         os.makedirs(out_dir, exist_ok=True)
+        # NEW: ensure correct render order for multi-env seg
+        self.gym.fetch_results(self.sim, True)
+        self.gym.step_graphics(self.sim)
         self.gym.render_all_camera_sensors(self.sim)
         if torch.cuda.is_available():
             torch.cuda.synchronize(self.sim_device)
@@ -422,16 +459,53 @@ class DexHandManipBiHEnv(VecTask):
 
     def _get_allowed_object_ids_for_env(self, env_id: int):
         """
-        According to the seg_off rule you gave in _create_envs(), compute the object ids for each env.
-        Right object: 201 + seg_off, Left object: 202 + seg_off
-        (You can keep only one of them, or exclude the table 301+seg_off as well)
-        """
+        Build a robust allowed-ids set so that it works whether IMAGE_SEGMENTATION returns:
+        - rigid-body segmentation IDs (set via set_rigid_body_segmentation_id), or
+        - actor instance IDs (per-sim or per-env; sometimes off-by-one in some builds).
+
+        Also intersect with what's actually present in this env's segmentation image.
+       """
         seg_off = env_id * 1000
-        obj_ids = torch.tensor([201 + seg_off, 202 + seg_off], device=self.sim_device, dtype=torch.int32)
-        return obj_ids
 
+        candidates: list[int] = []
 
-    
+        # 1) Our explicit rigid-body segmentation IDs (with and without offset)
+        candidates += [201 + seg_off, 202 + seg_off, 201, 202]
+
+        # 2) Actor instance IDs – SIM domain (existing fallback)
+        try:
+            rid_sim = int(self._global_manip_obj_rh_indices[env_id, 0].item())
+            lid_sim = int(self._global_manip_obj_lh_indices[env_id, 0].item())
+            candidates += [rid_sim, lid_sim, rid_sim + 1, lid_sim + 1]
+        except Exception:
+            pass
+
+        # 3) Actor instance IDs – ENV domain (many Isaac Gym builds use these in IMAGE_SEGMENTATION)
+        try:
+            rid_env = int(self.gym.find_actor_index(self.envs[env_id], "manip_obj_rh", gymapi.DOMAIN_ENV))
+            lid_env = int(self.gym.find_actor_index(self.envs[env_id], "manip_obj_lh", gymapi.DOMAIN_ENV))
+            candidates += [rid_env, lid_env, rid_env + 1, lid_env + 1]
+        except Exception:
+            pass
+
+        # Deduplicate -> tensor on sim device
+        uniq = sorted(set(int(x) for x in candidates))
+        cand_t = torch.tensor(uniq, device=self.sim_device, dtype=torch.int32)
+
+        # 4) If we already have seg for this env, only keep IDs that actually appear there
+        try:
+            if hasattr(self, "last_segs") and self.last_segs is not None and env_id < len(self.last_segs):
+                seg_unique = torch.unique(self.last_segs[env_id].to(torch.int32)).to(self.sim_device)
+                present = cand_t[torch.isin(cand_t, seg_unique)]
+                if present.numel() > 0:
+                    return present
+        except Exception:
+            # If anything fails, fall back to the full candidate set
+            pass
+
+        # 5) Fallback: return the full candidate set; downstream will AND with seg anyway
+        return cand_t
+
 
     def _depth_to_pointcloud_from_seg(
         self,
@@ -518,48 +592,6 @@ class DexHandManipBiHEnv(VecTask):
 
         return pts_cam
 
-
-
-
-    def _grab_rgb_images(self, device="gpu"):
-        """
-        Fetch RGB image data (revised)
-        """
-        rgb_images = []
-        
-        self.gym.render_all_camera_sensors(self.sim)
-        self.gym.start_access_image_tensors(self.sim)
-        
-        try:
-            for env_ptr, cam in zip(self.envs, self.cameras):
-                if device == "gpu":
-                    rgb_tensor = self.gym.get_camera_image_gpu_tensor(
-                        self.sim, env_ptr, cam, gymapi.IMAGE_COLOR
-                    )
-                    rgb = gymtorch.wrap_tensor(rgb_tensor)
-                    
-                    print(f"Raw RGB tensor shape: {rgb.shape}, dtype: {rgb.dtype}")
-                    
-                    # Ensure correct format
-                    if len(rgb.shape) == 1:
-                        # If 1D, reshape
-                        H, W = self.last_depths[0].shape if hasattr(self, 'last_depths') and self.last_depths else (180, 320)
-                        rgb = rgb.view(H, W, 4)
-                    elif len(rgb.shape) == 3 and rgb.shape[0] == 4:
-                        # If (4, H, W), convert to (H, W, 4)
-                        rgb = rgb.permute(1, 2, 0)
-                    
-                    print(f"Processed RGB tensor shape: {rgb.shape}")
-                    rgb_images.append(rgb.to(self.sim_device))
-                else:
-                    rgb_np = self.gym.get_camera_image(self.sim, env_ptr, cam, gymapi.IMAGE_COLOR)
-                    print(f"RGB numpy shape: {rgb_np.shape}")
-                    rgb = torch.from_numpy(rgb_np.astype(np.uint8))
-                    rgb_images.append(rgb.to(self.sim_device))
-        finally:
-            self.gym.end_access_image_tensors(self.sim)
-        
-        return rgb_images
 
 
     def _save_depth_16bit_png(self, out_dir: str, step: int, max_envs: int = 1024, scale: float = 1000.0):
@@ -713,7 +745,8 @@ class DexHandManipBiHEnv(VecTask):
             if depth_tensor is None:
                 continue
                 
-            print(f"\n=== Processing object pointcloud for env {i} ===")
+            if self.debug:
+                print(f"\n=== Processing object pointcloud for env {i} ===")
             
             # Choose different extraction functions based on method
             if method == "simple":
@@ -780,9 +813,10 @@ class DexHandManipBiHEnv(VecTask):
             
             if depth_tensor is None or rgb_tensor is None:
                 continue
-                
-            print(f"\n=== Processing colored object pointcloud for env {i} ===")
-            print(f"Depth shape: {depth_tensor.shape}, RGB shape: {rgb_tensor.shape}")
+
+            if self.debug: 
+                print(f"\n=== Processing colored object pointcloud for env {i} ===")
+                print(f"Depth shape: {depth_tensor.shape}, RGB shape: {rgb_tensor.shape}")
             
             # Convert to colored point cloud
             points_3d, colors = self._depth_to_colored_object_pointcloud_simple(
@@ -800,7 +834,8 @@ class DexHandManipBiHEnv(VecTask):
             # Save colored object point cloud
             out_path = os.path.join(out_dir, f"colored_object_pointcloud_env{i:02d}_step{step:06d}.png")
             
-            print(f"Saving colored object pointcloud env {i}: {points_3d.shape[0]} points")
+            if self.debug:
+                print(f"Saving colored object pointcloud env {i}: {points_3d.shape[0]} points")
             
             # Use the improved colored point cloud visualization function
             self._save_colored_pointcloud_visualization(
@@ -1345,41 +1380,118 @@ class DexHandManipBiHEnv(VecTask):
 
 
     def _render_all_cameras(self):
-        # Must render first so images/depth get updated
+        # Ensure physics results and graphics are updated before reading camera tensors
+        self.gym.fetch_results(self.sim, True)
+        self.gym.step_graphics(self.sim)
         self.gym.render_all_camera_sensors(self.sim)
 
-    def _grab_depth_images(self, device="gpu"):
-        """
-        Returns list[num_envs], where each item is shape=(H,W) "forward distance" (meters).
-        Pixels that hit nothing are set to 0 (you may also change to nan).
-        """
-        depths = []
 
-        # Render first, then batch-read all camera tensors between start/end
+    def _grab_depth_seg_rgb_once(self, cameras=None):
+        cams = self.cameras if cameras is None else cameras
+        depths, segs, rgbs = [], [], []
+        # 一次同步 + 一次 render + 一次 access
+        self.gym.fetch_results(self.sim, True)
+        self.gym.step_graphics(self.sim)
         self.gym.render_all_camera_sensors(self.sim)
         self.gym.start_access_image_tensors(self.sim)
-
         try:
-            for env_ptr, cam in zip(self.envs, self.cameras):
+            for env_ptr, cam in zip(self.envs, cams):
+                # depth
+                d = -gymtorch.wrap_tensor(
+                    self.gym.get_camera_image_gpu_tensor(self.sim, env_ptr, cam, gymapi.IMAGE_DEPTH)
+                ).to(self.sim_device).to(torch.float32)
+                d = torch.where((d > 0) & torch.isfinite(d), d, torch.zeros_like(d))
+                depths.append(d)
+
+                # seg
+                s = gymtorch.wrap_tensor(
+                    self.gym.get_camera_image_gpu_tensor(self.sim, env_ptr, cam, gymapi.IMAGE_SEGMENTATION)
+                ).to(self.sim_device).to(torch.int32)
+                segs.append(s)
+
+                # rgb（用得到再存）
+                rgb = gymtorch.wrap_tensor(
+                    self.gym.get_camera_image_gpu_tensor(self.sim, env_ptr, cam, gymapi.IMAGE_COLOR)
+                )
+                if rgb.ndim == 3 and rgb.shape[0] == 4:
+                    rgb = rgb.permute(1, 2, 0)
+                rgbs.append(rgb.to(self.sim_device))
+        finally:
+            self.gym.end_access_image_tensors(self.sim)
+
+        return depths, segs, rgbs
+
+    def _grab_depth_images(self, device="gpu", cameras=None):
+        depths = []
+        cams = self.cameras if cameras is None else cameras
+        self.gym.render_all_camera_sensors(self.sim)
+        self.gym.start_access_image_tensors(self.sim)
+        try:
+            for env_ptr, cam in zip(self.envs, cams):
                 if device == "gpu":
-                    # This is the depth buffer on GPU (Isaac Gym: forward hits return negative distances; misses are <= 0 or very small negatives)
-                    depth_tensor = self.gym.get_camera_image_gpu_tensor(
-                        self.sim, env_ptr, cam, gymapi.IMAGE_DEPTH
-                    )
-                    d = gymtorch.wrap_tensor(depth_tensor)  # torch.float32, HxW, on GPU
-                    d = -d  # Convert to "positive distance"; misses may become >= 0? (practically treat <=0 / huge values together)
-                    # Set invalid values to 0 (or use torch.nan)
+                    depth_tensor = self.gym.get_camera_image_gpu_tensor(self.sim, env_ptr, cam, gymapi.IMAGE_DEPTH)
+                    d = -gymtorch.wrap_tensor(depth_tensor).to(self.sim_device).to(torch.float32)
                     d_valid = torch.where((d > 0) & torch.isfinite(d), d, torch.zeros_like(d))
-                    depths.append(d_valid.to(self.sim_device))
+                    depths.append(d_valid)
                 else:
                     d_np = self.gym.get_camera_image(self.sim, env_ptr, cam, gymapi.IMAGE_DEPTH).astype(np.float32)
-                    d = -torch.from_numpy(d_np)  # Make positive
+                    d = -torch.from_numpy(d_np)
                     d_valid = torch.where((d > 0) & torch.isfinite(d), d, torch.zeros_like(d))
                     depths.append(d_valid.to(self.sim_device))
         finally:
             self.gym.end_access_image_tensors(self.sim)
-
         return depths
+
+    def _grab_seg_images(self, device="gpu", cameras=None):
+        segs = []
+        cams = self.cameras if cameras is None else cameras
+
+        # NEW: ensure correct render order for multi-env seg
+        self.gym.fetch_results(self.sim, True)
+        self.gym.step_graphics(self.sim)
+
+
+        self.gym.render_all_camera_sensors(self.sim)
+        self.gym.start_access_image_tensors(self.sim)
+        try:
+            for env_ptr, cam in zip(self.envs, cams):
+                if device == "gpu":
+                    seg_tensor = self.gym.get_camera_image_gpu_tensor(self.sim, env_ptr, cam, gymapi.IMAGE_SEGMENTATION)
+                    seg = gymtorch.wrap_tensor(seg_tensor).to(self.sim_device).to(torch.int32)
+                else:
+                    seg_np = self.gym.get_camera_image(self.sim, env_ptr, cam, gymapi.IMAGE_SEGMENTATION)
+                    seg = torch.from_numpy(seg_np.astype(np.int32)).to(self.sim_device)
+                segs.append(seg)
+        finally:
+            self.gym.end_access_image_tensors(self.sim)
+        return segs
+
+    def _grab_rgb_images(self, device="gpu", cameras=None):
+        rgb_images = []
+        cams = self.cameras if cameras is None else cameras
+        # NEW: ensure correct render order for multi-env seg
+        self.gym.fetch_results(self.sim, True)
+        self.gym.step_graphics(self.sim)
+
+        self.gym.render_all_camera_sensors(self.sim)
+        self.gym.start_access_image_tensors(self.sim)
+        try:
+            for env_ptr, cam in zip(self.envs, cams):
+                if device == "gpu":
+                    rgb_tensor = self.gym.get_camera_image_gpu_tensor(self.sim, env_ptr, cam, gymapi.IMAGE_COLOR)
+                    rgb = gymtorch.wrap_tensor(rgb_tensor)  # (H,W,4) or (4,H,W)
+                    if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                        pass  # (H,W,4)
+                    elif rgb.ndim == 3 and rgb.shape[0] == 4:
+                        rgb = rgb.permute(1, 2, 0)
+                    rgb_images.append(rgb.to(self.sim_device))
+                else:
+                    rgb_np = self.gym.get_camera_image(self.sim, env_ptr, cam, gymapi.IMAGE_COLOR)
+                    rgb = torch.from_numpy(rgb_np.astype(np.uint8))
+                    rgb_images.append(rgb.to(self.sim_device))
+        finally:
+            self.gym.end_access_image_tensors(self.sim)
+        return rgb_images
 
 
     def init_data(self):
@@ -1751,29 +1863,6 @@ class DexHandManipBiHEnv(VecTask):
 
         return obj_actor, obj_index
 
-    def _grab_seg_images(self, device="gpu"):
-        """
-        Return a list[num_envs], where each item is an int32 segmentation image of shape (H, W).
-        The content is actor instance id (background is often -1).
-        """
-        segs = []
-        self.gym.render_all_camera_sensors(self.sim)
-        self.gym.start_access_image_tensors(self.sim)
-        try:
-            for env_ptr, cam in zip(self.envs, self.cameras):
-                if device == "gpu":
-                    seg_tensor = self.gym.get_camera_image_gpu_tensor(
-                        self.sim, env_ptr, cam, gymapi.IMAGE_SEGMENTATION
-                    )
-                    seg = gymtorch.wrap_tensor(seg_tensor).to(self.sim_device).to(torch.int32)  # (H,W)
-                else:
-                    seg_np = self.gym.get_camera_image(self.sim, env_ptr, cam, gymapi.IMAGE_SEGMENTATION)
-                    seg = torch.from_numpy(seg_np.astype(np.int32)).to(self.sim_device)
-                segs.append(seg)
-        finally:
-            self.gym.end_access_image_tensors(self.sim)
-        return segs
-
 
     def _update_states(self):
         self.rh_states.update(
@@ -1834,7 +1923,7 @@ class DexHandManipBiHEnv(VecTask):
         ]
 
         tip_indices = [self.dexhand_lh.body_names.index(name) for name in tip_names]
-        self.lh_states["joints_tip_state"] = self.rh_states["joints_state"][:, tip_indices, :]
+        self.lh_states["joints_tip_state"] = self.lh_states["joints_state"][:, tip_indices, :]
 
         self.lh_states.update(
             {
@@ -2115,6 +2204,28 @@ class DexHandManipBiHEnv(VecTask):
 
             print(f"[seg] env {i} -> {color_path} / {raw_path}")
 
+    def _save_rgb_preview_png(self, out_dir: str, step: int, max_envs: int = 4, which: str = "front"):
+        import os
+        from PIL import Image
+        imgs = self.last_rgb_images if which == "front" else self.last_rgb_images_top
+        if imgs is None:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        num = min(len(imgs), max_envs)
+        for i in range(num):
+            rgb = imgs[i].detach().cpu()
+            # 轉成 (H,W,3) uint8
+            if rgb.dtype != torch.uint8:
+                rgb = rgb.clamp(0, 255).to(torch.uint8)
+            if rgb.ndim == 3 and rgb.shape[-1] == 4:
+                rgb = rgb[..., :3]
+            elif rgb.ndim == 3 and rgb.shape[0] == 4:
+                rgb = rgb.permute(1, 2, 0)[..., :3]
+            Image.fromarray(rgb.numpy(), mode="RGB").save(
+                os.path.join(out_dir, f"rgb_{which}_env{i:02d}_step{step:06d}.png")
+            )
+
+
     def compute_observations(self):
         self._refresh()
         obs_rh = self.compute_observations_side("rh")
@@ -2124,13 +2235,40 @@ class DexHandManipBiHEnv(VecTask):
 
         # === Render + grab depth images ===
         self._render_all_cameras()
-        self.last_depths = self._grab_depth_images(device="gpu")
-        self.last_segs   = self._grab_seg_images(device="gpu")
+        # self.last_depths = self._grab_depth_images(device="gpu")
+        # self.last_segs   = self._grab_seg_images(device="gpu")
+
+        # 既有（前視）
+        # self.last_depths = self._grab_depth_images(device="gpu", cameras=self.cameras)
+        # self.last_segs   = self._grab_seg_images(device="gpu", cameras=self.cameras)
+        # self.last_rgb_images = self._grab_rgb_images(device="gpu", cameras=self.cameras)
+
+        # # 新增（俯視）
+        # self.last_depths_top = self._grab_depth_images(device="gpu", cameras=self.cameras_top)
+        # self.last_segs_top   = self._grab_seg_images(device="gpu", cameras=self.cameras_top)
+        # self.last_rgb_images_top = self._grab_rgb_images(device="gpu", cameras=self.cameras_top)
+
+        self.last_depths, self.last_segs, self.last_rgb_images = self._grab_depth_seg_rgb_once(self.cameras)
+        self.last_depths_top, self.last_segs_top, self.last_rgb_images_top = self._grab_depth_seg_rgb_once(self.cameras_top)
+
+        # After images are available, calibrate per-env camera origin mode once
+        if self.last_depths is not None and self.last_segs is not None:
+            for env_id in range(min(len(self.last_depths), self.num_envs)):
+                if self._cam_origin_mode["front"].get(env_id, None) is None:
+                    self._calibrate_camera_origin_mode_for_env(env_id, view="front")
+        if self.last_depths_top is not None and self.last_segs_top is not None:
+            for env_id in range(min(len(self.last_depths_top), self.num_envs)):
+                if self._cam_origin_mode["top"].get(env_id, None) is None:
+                    self._calibrate_camera_origin_mode_for_env(env_id, view="top")
+
         
         step = int(self.gym.get_frame_count(self.sim))
         out_dir = "cam_debug"
 
-        # self._debug_dump_seg_stats(max_envs=4)
+        if self.debug:
+            self._save_rgb_preview_png(out_dir, step, max_envs=4, which="top")
+
+            self._debug_dump_seg_stats(max_envs=4)
         # self._save_segmentation_quick(out_dir, step, max_envs=4)
         # import ipdb; ipdb.set_trace()
 
@@ -2148,36 +2286,33 @@ class DexHandManipBiHEnv(VecTask):
             self._printed_depth_info = True
 
         self.save_contacts(
-                out_dir, step, max_envs=1024,
+            out_dir, step, max_envs=1024,
+            object_depth_range=(0.6, 1.2),
+            center_crop_ratio=0.6,
+            shade="cam_depth"  
+        )
+
+        # === Save every 50 steps (adjustable) ===
+        step = int(self.gym.get_frame_count(self.sim))
+        if self.debug and ((step % 10) == 0 and self.last_depths is not None):
+            out_dir = "depth_debug"  # your desired output folder
+            out_dir = "depth_debug"  # your desired output folder
+            # Save color preview
+            self._save_depth_preview_png(out_dir, step, max_envs=4)
+            # Also save 16-bit depth (optional)
+            self._save_depth_16bit_png(out_dir, step, max_envs=4, scale=1000.0)  # millimeters
+            # ★ New: save point cloud visualization
+            self._save_no_rgb_object_pointcloud_png(
+                out_dir, step, max_envs=4,
+                views=((20, -60),),
+                color_method='depth'  # or 'height', 'uniform', 'distance', 'coordinate'
+            )
+            self._find_contacts_and_save_cam(
+                out_dir, step, max_envs=4,
                 object_depth_range=(0.6, 1.2),
                 center_crop_ratio=0.6,
-                shade="cam_depth"  
+                shade="cam_depth"   # or "height"
             )
-
-        # # === Save every 50 steps (adjustable) ===
-        # step = int(self.gym.get_frame_count(self.sim))
-        # if (step % 10) == 0 and self.last_depths is not None:
-        #     out_dir = "depth_debug"  # your desired output folder
-        #     out_dir = "depth_debug"  # your desired output folder
-        #     # Save color preview
-        #     self._save_depth_preview_png(out_dir, step, max_envs=1024)
-        #     # Also save 16-bit depth (optional)
-        #     self._save_depth_16bit_png(out_dir, step, max_envs=1024, scale=1000.0)  # millimeters
-        #     # ★ New: save point cloud visualization
-        #     self._save_no_rgb_object_pointcloud_png(
-        #         out_dir, step, max_envs=1024,
-        #         views=((20, -60),),
-        #         color_method='depth'  # or 'height', 'uniform', 'distance', 'coordinate'
-        #     )
-        #     self._find_contacts_and_save_cam(
-        #         out_dir, step, max_envs=1024,
-        #         object_depth_range=(0.6, 1.2),
-        #         center_crop_ratio=0.6,
-        #         shade="cam_depth"   # or "height"
-        #     )
-
-
-
 
     def _depth_to_object_pointcloud_simple(self, depth_tensor, 
                                      horizontal_fov_deg=69.4,
@@ -2273,17 +2408,22 @@ class DexHandManipBiHEnv(VecTask):
         t_wc: [3]   camera position in world coordinates
         """
         # The world's origin of the env (Isaac places each env on a grid)
-        o = self.gym.get_env_origin(self.envs[env_id])
-        origin_w = torch.tensor([o.x, o.y, o.z], device=self.device, dtype=torch.float32)
+        # o = self.gym.get_env_origin(self.envs[env_id])
+        # origin_w = torch.tensor([o.x, o.y, o.z], device=self.device, dtype=torch.float32)
 
         # Retrieve the "env-local" position and target saved when set_camera_location was called
         cam_pos_local = self._cam_pos_local[env_id]
         cam_tgt_local = self._cam_target_local[env_id]
 
-        # Transform to world coordinates
-        t_wc = origin_w + cam_pos_local
-        tgt_w = origin_w + cam_tgt_local
-
+        add_origin = self._cam_origin_mode.get("front", {}).get(env_id, False)
+        if add_origin:
+            o = self.gym.get_env_origin(self.envs[env_id])
+            origin_w = torch.tensor([o.x, o.y, o.z], device=self.device, dtype=torch.float32)
+            t_wc = origin_w + cam_pos_local
+            tgt_w = origin_w + cam_tgt_local
+        else:
+            t_wc = cam_pos_local
+            tgt_w = cam_tgt_local
         # Use the world's z as an up guess, then build an orthonormal basis (right-handed coordinates)
         up_guess = torch.tensor([0.0, 0.0, 1.0], device=self.device)
         forward = tgt_w - t_wc
@@ -2297,6 +2437,12 @@ class DexHandManipBiHEnv(VecTask):
         R_wc = torch.stack([right, up, forward], dim=1)  # shape [3,3]
         return R_wc, t_wc
 
+    def _nn_contacts_for_hand_world(self, joints_world: torch.Tensor, pc_world: torch.Tensor):
+        D = torch.cdist(joints_world, pc_world)  # [J, N]
+        idx = torch.argmin(D, dim=1)
+        cpts = pc_world[idx]
+        d = D[torch.arange(D.shape[0], device=D.device), idx]
+        return idx, cpts, d
 
 
     def _nn_contacts_for_hand(self, joints_cam: torch.Tensor, pc_cam: torch.Tensor):
@@ -2348,7 +2494,7 @@ class DexHandManipBiHEnv(VecTask):
 
     def _world_to_camera(self, pts_world: torch.Tensor, env_id: int):
         R_wc, t_wc = self._get_env_camera_pose_world(env_id)
-        return (pts_world - t_wc[None, :]) @ R_wc    # correct: @ R_wc
+        return (pts_world - t_wc[None, :]) @ R_wc.t()
 
     def _build_hand_skeleton_edges(self, body_names: List[str]):
         """
@@ -2559,52 +2705,107 @@ class DexHandManipBiHEnv(VecTask):
                                 shade: str = "cam_depth",
                                 contact_thresh: float = 0.01):
         import os
+        from PIL import Image
         os.makedirs(out_dir, exist_ok=True)
         if self.last_depths is None:
             return
 
-
         # todo: its only works for env_id = 0
         num = min(len(self.last_depths), max_envs)
         for env_id in range(num):
-            depth_tensor = self.last_depths[env_id]
-            if depth_tensor is None:
-                continue
 
-            seg_tensor = self.last_segs[env_id]
+            # ---------- (A) 讀前視相機影像 ----------
+            depth_front = self.last_depths[env_id]
+            if depth_front is None:
+                continue
+            seg_front = self.last_segs[env_id]
+
             allowed_ids = self._get_allowed_object_ids_for_env(env_id)
-            pc_cam = self._depth_to_pointcloud_from_seg(
-                depth_tensor=depth_tensor,
-                seg_tensor=seg_tensor,
+
+            # 由前視相機建立點雲 (在 "front" 相機座標系)
+            pc_cam_front = self._depth_to_pointcloud_from_seg(
+                depth_tensor=depth_front,
+                seg_tensor=seg_front,
                 allowed_ids=allowed_ids,
                 horizontal_fov_deg=69.4,
-                max_points=200000,
-                border_dilate_px=1,
-                z_min=0.45,     # ← adjust according to the distance between your camera and the table
-                z_max=1.30      # ← avoid capturing far background (the yellow block will not appear
+                max_points=200_000,
+                border_dilate_px=0,
+                # z_min=0.45,   # 依你相機與桌面的距離微調
+                # z_max=1.30
             )
-            if pc_cam is None or pc_cam.shape[0] == 0:
-                print(f"[contacts/cam] env {env_id}: no OBJECT point cloud (seg-mask empty).")
+
+            if pc_cam_front is None or pc_cam_front.shape[0] == 0:
+                print(f"[contacts/cam] env {env_id}: no OBJECT point cloud from FRONT (seg empty).")
+                # 就算前視沒點，仍嘗試用 top（但視覺化會比較空）
+                pc_cam_front = None
+
+            # ---------- (B) 讀俯視相機影像 & 轉到前視相機座標 ----------
+            pc_cam_top_in_front = None
+            have_top = (getattr(self, "last_depths_top", None) is not None) and \
+                    (getattr(self, "last_segs_top", None) is not None)
+            if have_top and env_id < len(self.last_depths_top):
+                depth_top = self.last_depths_top[env_id]
+                seg_top   = self.last_segs_top[env_id]
+                if (depth_top is not None) and (seg_top is not None):
+                    # 先在 "top" 相機座標系建立點雲
+                    pc_cam_top = self._depth_to_pointcloud_from_seg(
+                        depth_tensor=depth_top,
+                        seg_tensor=seg_top,
+                        allowed_ids=allowed_ids,
+                        horizontal_fov_deg=69.4,
+                        max_points=200_000,
+                        border_dilate_px=0,
+                        # 俯視通常較遠，放寬 z 範圍（視你的高度調整）
+                        # z_min=0.10,
+                        # z_max=2.00
+                    )
+                    if (pc_cam_top is not None) and (pc_cam_top.shape[0] > 0):
+                        # top(cam) → world → front(cam)
+                        pc_world_from_top   = self._camera_to_world_view(pc_cam_top, env_id, view="top")
+                        pc_cam_top_in_front = self._world_to_camera_view(pc_world_from_top, env_id, view="front")
+
+            # ---------- (C) 合併到「前視相機座標」的點雲 ----------
+            pc_cam_merged = None
+            pcs = []
+            if pc_cam_front is not None and pc_cam_front.shape[0] > 0:
+                pcs.append(pc_cam_front)
+            if pc_cam_top_in_front is not None and pc_cam_top_in_front.shape[0] > 0:
+                pcs.append(pc_cam_top_in_front)
+
+            if len(pcs) == 0:
+                print(f"[contacts/cam] env {env_id}: no OBJECT point cloud from FRONT nor TOP.")
+                # 仍儲存 top 的 RGB 以利排錯
+                if getattr(self, "last_rgb_images_top", None) is not None and env_id < len(self.last_rgb_images_top):
+                    rgb_top = self.last_rgb_images_top[env_id]
+                    _save_single_rgb(rgb_top, os.path.join(out_dir, f"rgb_top_env{env_id:02d}_step{step:06d}.png"))
                 continue
 
-            # === joints world → camera (this time include the base in order to connect to the palm)
+            pc_cam_merged = torch.cat(pcs, dim=0)
+
+            # 避免點太多（可視情況下採）
+            if pc_cam_merged.shape[0] > 200_000:
+                idx = torch.randperm(pc_cam_merged.shape[0], device=pc_cam_merged.device)[:200_000]
+                pc_cam_merged = pc_cam_merged[idx]
+
+            # ---------- (D) joints 轉到「前視相機座標」 ----------
+            # joints world（你的狀態裡本來就有）
             rh_world_all = self.rh_states["joints_state"][env_id, :, :3]   # [18,3]
             lh_world_all = self.lh_states["joints_state"][env_id, :, :3]
-            rh_cam_all = self._world_to_camera(rh_world_all, env_id)
-            lh_cam_all = self._world_to_camera(lh_world_all, env_id)
 
-            # In your original nearest-neighbor computation you dropped the base; keep it that way (compute contacts using only movable joints)
+            # 做完整骨架視覺化用（含 base/palm）
+            rh_cam_all = self._world_to_camera_view(rh_world_all, env_id, view="front")
+            lh_cam_all = self._world_to_camera_view(lh_world_all, env_id, view="front")
+
+            # 計算接觸只用可動關節（維持你原本作法：丟掉 index 0 的 base）
             rh_world = rh_world_all[1:, :]
             lh_world = lh_world_all[1:, :]
-            rh_cam = self._world_to_camera(rh_world, env_id)
-            lh_cam = self._world_to_camera(lh_world, env_id)
+            rh_cam   = self._world_to_camera_view(rh_world, env_id, view="front")
+            lh_cam   = self._world_to_camera_view(lh_world, env_id, view="front")
 
-            # Nearest neighbors
-            _, rh_cpts_cam_all, rh_d_all = self._nn_contacts_for_hand_cam(rh_cam, pc_cam)
-            _, lh_cpts_cam_all, lh_d_all = self._nn_contacts_for_hand_cam(lh_cam, pc_cam)
+            # ---------- (E) 最近鄰接觸（在「前視相機座標」進行」） ----------
+            _, rh_cpts_cam_all, rh_d_all = self._nn_contacts_for_hand_cam(rh_cam, pc_cam_merged)
+            _, lh_cpts_cam_all, lh_d_all = self._nn_contacts_for_hand_cam(lh_cam, pc_cam_merged)
 
-            # Keep only contacts with distance < 0.01 m
-            contact_thresh = 0.01  # your intended threshold
             rh_mask = rh_d_all < contact_thresh
             lh_mask = lh_d_all < contact_thresh
             rh_cam_vis = rh_cam[rh_mask]
@@ -2612,25 +2813,28 @@ class DexHandManipBiHEnv(VecTask):
             lh_cam_vis = lh_cam[lh_mask]
             lh_cpts_cam = lh_cpts_cam_all[lh_mask]
 
-            # Build skeleton edges (using the name lists you provided)
+            # ---------- (F) 骨架連線 & 繪圖 ----------
             rh_edges = self._build_hand_edges(self.dexhand_rh.body_names, add_palm_links=True)
             lh_edges = self._build_hand_edges(self.dexhand_lh.body_names, add_palm_links=True)
 
-            # Save image (hands and contact points will be drawn on top of the point cloud)
             out_path = os.path.join(out_dir, f"contacts_cam_env{env_id:02d}_step{step:06d}.png")
             self._save_contacts_visualization_cam(
                 out_path=out_path,
-                pc_cam=pc_cam,
+                pc_cam=pc_cam_merged,  # ← 用合併後的點雲
                 rh_j_all_cam=rh_cam_all, lh_j_all_cam=lh_cam_all,
                 rh_edges=rh_edges, lh_edges=lh_edges,
                 rh_j_vis_cam=rh_cam_vis, rh_c_vis_cam=rh_cpts_cam,
                 lh_j_vis_cam=lh_cam_vis, lh_c_vis_cam=lh_cpts_cam,
-                views=((0, 0),), shade="cam_depth"
+                views=((0, 0),), shade="cam_depth" if shade is None else shade
             )
 
+            # ---------- (G) 另外把「俯視相機 RGB」存檔（debug） ----------
+            if getattr(self, "last_rgb_images_top", None) is not None and env_id < len(self.last_rgb_images_top):
+                rgb_top = self.last_rgb_images_top[env_id]
+                _save_single_rgb(rgb_top, os.path.join(out_dir, f"rgb_top_env{env_id:02d}_step{step:06d}.png"))
 
-
-            print(f"[contacts/cam] env {env_id}: RH/LH contacts(<{contact_thresh:.3f}m")
+            print(f"[contacts/cam] env {env_id}: RH/LH contacts(<{contact_thresh:.3f}m) "
+                f"rh={int(rh_mask.sum().item())}, lh={int(lh_mask.sum().item())})")
 
 
     def save_contacts(self, out_dir: str, step: int, max_envs: int = 1024,
@@ -2771,7 +2975,7 @@ class DexHandManipBiHEnv(VecTask):
         self.obs_dict["extra"] = torch.cat([self.obs_dict["extra"], pad], dim=1)
 
 
-
+    
 
     def _depth_to_colored_object_pointcloud_simple(self, depth_tensor, rgb_tensor,
                                                 horizontal_fov_deg=69.4,
@@ -3650,6 +3854,132 @@ class DexHandManipBiHEnv(VecTask):
         self.running_progress_buf += 1
         self.randomize_buf += 1
 
+    def _get_env_camera_pose_world_view(self, env_id: int, view: str = "front"):
+        """
+        回傳 (R_wc, t_wc)，依 view 使用前視或俯視的相機位姿。
+        會考慮每個 env 的自動校正結果（是否需要加上 env origin）。
+        """
+        # env-local camera pose recorded at creation
+        if view == "top":
+            cam_pos_local = self._cam_pos_local_top[env_id]
+            cam_tgt_local = self._cam_target_local_top[env_id]
+        else:
+            cam_pos_local = self._cam_pos_local[env_id]
+            cam_tgt_local = self._cam_target_local[env_id]
+
+        add_origin: Optional[bool] = self._cam_origin_mode.get(view, {}).get(env_id, None)
+        # default to False (no origin) until calibration decides
+        if add_origin is None:
+            add_origin = False
+
+        if add_origin:
+            o = self.gym.get_env_origin(self.envs[env_id])
+            origin_w = torch.tensor([o.x, o.y, o.z], device=self.device, dtype=torch.float32)
+            t_wc = origin_w + cam_pos_local
+            tgt_w = origin_w + cam_tgt_local
+        else:
+            t_wc = cam_pos_local
+            tgt_w = cam_tgt_local
+
+        up_guess = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+        forward = tgt_w - t_wc
+        forward = forward / (torch.norm(forward) + 1e-8)
+        right = torch.cross(forward, up_guess); right = right / (torch.norm(right) + 1e-8)
+        up = torch.cross(right, forward);       up = up / (torch.norm(up) + 1e-8)
+        R_wc = torch.stack([right, up, forward], dim=1)  # columns = axes
+        return R_wc, t_wc
+
+    def _world_to_camera_view(self, pts_world: torch.Tensor, env_id: int, view: str = "front"):
+        R_wc, t_wc = self._get_env_camera_pose_world_view(env_id, view=view)
+        return (pts_world - t_wc[None, :]) @ R_wc  # world -> cam
+
+    def _camera_to_world_view(self, pts_cam: torch.Tensor, env_id: int, view: str = "front"):
+        R_wc, t_wc = self._get_env_camera_pose_world_view(env_id, view=view)
+        return pts_cam @ R_wc.t() + t_wc[None, :]  # cam -> world
+
+
+    def _calibrate_camera_origin_mode_for_env(self, env_id: int, view: str = "front"):
+        """
+        使用當前 depth+seg 估計物體點雲中心（相機座標），
+        將物體 root 世界座標投到相機座標，比較「加 origin / 不加 origin」兩種外參與點雲中心的距離，
+        選擇較小者，並記錄結果供後續使用。
+        """
+        try:
+            if view == "top":
+                if self.last_depths_top is None or self.last_segs_top is None:
+                    return
+                depth = self.last_depths_top[env_id]
+                seg = self.last_segs_top[env_id]
+            else:
+                if self.last_depths is None or self.last_segs is None:
+                    return
+                depth = self.last_depths[env_id]
+                seg = self.last_segs[env_id]
+
+            if depth is None or seg is None:
+                return
+
+            allowed = self._get_allowed_object_ids_for_env(env_id)
+            pc_cam = self._depth_to_pointcloud_from_seg(
+                depth_tensor=depth,
+                seg_tensor=seg,
+                allowed_ids=allowed,
+                horizontal_fov_deg=69.4,
+                max_points=60000,
+                border_dilate_px=0,
+            )
+            if pc_cam is None or pc_cam.shape[0] < 30:
+                return
+
+            pc_center = torch.median(pc_cam, dim=0)[0]
+
+            if view == "top":
+                cam_pos_local = self._cam_pos_local_top[env_id]
+                cam_tgt_local = self._cam_target_local_top[env_id]
+            else:
+                cam_pos_local = self._cam_pos_local[env_id]
+                cam_tgt_local = self._cam_target_local[env_id]
+
+            o = self.gym.get_env_origin(self.envs[env_id])
+            origin_w = torch.tensor([o.x, o.y, o.z], device=self.device, dtype=torch.float32)
+
+            def build_RT(add_origin: bool):
+                if add_origin:
+                    t_wc = origin_w + cam_pos_local
+                    tgt_w = origin_w + cam_tgt_local
+                else:
+                    t_wc = cam_pos_local
+                    tgt_w = cam_tgt_local
+                up_guess = torch.tensor([0.0, 0.0, 1.0], device=self.device)
+                forward = (tgt_w - t_wc); forward = forward / (torch.norm(forward) + 1e-8)
+                right = torch.cross(forward, up_guess); right = right / (torch.norm(right) + 1e-8)
+                up = torch.cross(right, forward); up = up / (torch.norm(up) + 1e-8)
+                R_wc = torch.stack([right, up, forward], dim=1)
+                return R_wc, t_wc
+
+            R_wc_A, t_wc_A = build_RT(True)
+            R_wc_B, t_wc_B = build_RT(False)
+
+            rh_w = self._manip_obj_rh_root_state[env_id, :3]
+            lh_w = self._manip_obj_lh_root_state[env_id, :3]
+            rh_A = (rh_w - t_wc_A) @ R_wc_A
+            lh_A = (lh_w - t_wc_A) @ R_wc_A
+            rh_B = (rh_w - t_wc_B) @ R_wc_B
+            lh_B = (lh_w - t_wc_B) @ R_wc_B
+
+            dA = torch.min(torch.norm(rh_A - pc_center), torch.norm(lh_A - pc_center))
+            dB = torch.min(torch.norm(rh_B - pc_center), torch.norm(lh_B - pc_center))
+
+            chosen = bool(dA < dB)
+            self._cam_origin_mode[view][env_id] = chosen
+            if not self._cam_origin_mode_printed[view].get(env_id, False):
+                how = "+origin" if chosen else "no-origin"
+                print(f"[cam-calib] env {env_id} view={view}: chosen {how} (dA={float(dA):.4f}, dB={float(dB):.4f})")
+                self._cam_origin_mode_printed[view][env_id] = True
+        except Exception:
+            pass
+
+
 
     def create_camera(
         self,
@@ -3689,9 +4019,29 @@ class DexHandManipBiHEnv(VecTask):
         self._cam_pos_local.append(torch.tensor([cam_pos.x, cam_pos.y, cam_pos.z], device=self.device, dtype=torch.float32))
         self._cam_target_local.append(torch.tensor([cam_target.x, cam_target.y, cam_target.z], device=self.device, dtype=torch.float32))
 
+        # === 新增：俯視（top-down）===
+        camera_cfg_top = gymapi.CameraProperties()
+        camera_cfg_top.enable_tensors = True
+        camera_cfg_top.width  = camera_cfg.width
+        camera_cfg_top.height = camera_cfg.height
+        camera_cfg_top.horizontal_fov = 69.4
 
-        return camera
+        camera_top = isaac_gym.create_camera_sensor(env, camera_cfg_top)
+        # 以桌面中心上方為基準（可再微調）
+        cam_pos_top    = gymapi.Vec3(-1.2, 0, 0.74)
+        # cam_pos_top    = gymapi.Vec3(0, 0, 1.5)
+        cam_target_top = gymapi.Vec3(0.05, 0, 0.3)
+        isaac_gym.set_camera_location(camera_top, env, cam_pos_top, cam_target_top)
+        self.cameras_top.append(camera_top)
 
+        # 紀錄「俯視相機」的 env-local 位姿
+        if not hasattr(self, "_cam_pos_local_top"):
+            self._cam_pos_local_top = []
+            self._cam_target_local_top = []
+        self._cam_pos_local_top.append(torch.tensor([cam_pos_top.x, cam_pos_top.y, cam_pos_top.z], device=self.device, dtype=torch.float32))
+        self._cam_target_local_top.append(torch.tensor([cam_target_top.x, cam_target_top.y, cam_target_top.z], device=self.device, dtype=torch.float32))
+
+        return camera  
     def set_force_vis(self, env_ptr, part_k, has_force, side):
         self.gym.set_rigid_body_color(
             env_ptr,
