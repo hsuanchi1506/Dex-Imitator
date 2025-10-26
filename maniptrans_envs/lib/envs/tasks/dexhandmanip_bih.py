@@ -944,6 +944,8 @@ class DexHandManipBiHEnv(VecTask):
         plt.close(fig)
         print(f"Saved depth-colored pointcloud to: {out_path}")
 
+        # import ipdb; ipdb.set_trace()
+
 
     def create_sim(self):
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
@@ -1946,7 +1948,23 @@ class DexHandManipBiHEnv(VecTask):
         # Refresh states
         self._update_states()
 
-    def compute_reward(self, actions):
+    def compute_reward_tip(self, actions):
+        lh_rew_buf, lh_reset_buf, lh_success_buf, lh_failure_buf, lh_reward_dict, lh_error_buf = (
+            self.compute_reward_side_tip(actions, side="lh")
+        )
+        rh_rew_buf, rh_reset_buf, rh_success_buf, rh_failure_buf, rh_reward_dict, rh_error_buf = (
+            self.compute_reward_side_tip(actions, side="rh")
+        )
+        self.rew_buf = rh_rew_buf + lh_rew_buf
+        self.reset_buf = rh_reset_buf | lh_reset_buf
+        self.success_buf = rh_success_buf & lh_success_buf
+        self.failure_buf = rh_failure_buf | lh_failure_buf
+        self.error_buf = rh_error_buf | lh_error_buf
+        self.reward_dict = {
+            **{"rh_" + k: v for k, v in rh_reward_dict.items()},
+            **{"lh_" + k: v for k, v in lh_reward_dict.items()},
+        }
+
         lh_rew_buf, lh_reset_buf, lh_success_buf, lh_failure_buf, lh_reward_dict, lh_error_buf = (
             self.compute_reward_side(actions, side="lh")
         )
@@ -2084,6 +2102,124 @@ class DexHandManipBiHEnv(VecTask):
             max_length = torch.clamp(max_length, 0, self.rollout_len + self.rollout_begin + 3 + 1)
 
         rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf = compute_imitation_reward(
+            self.reset_buf,
+            self.progress_buf,
+            self.running_progress_buf,
+            self.actions,
+            side_states,
+            target_state,
+            max_length,
+            scale_factor,
+            (self.dexhand_rh if side == "rh" else self.dexhand_lh).weight_idx,
+        )
+        self.total_rew_buf += rew_buf
+        return rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf
+
+    def compute_reward_side_tip(self, actions, side="rh"):
+        side_demo_data = self.demo_data_rh if side == "rh" else self.demo_data_lh
+        target_state = {}
+        max_length = torch.clip(side_demo_data["seq_len"], 0, self.max_episode_length).float()
+        cur_idx = self.progress_buf
+        cur_wrist_pos = side_demo_data["wrist_pos"][torch.arange(self.num_envs), cur_idx]
+        target_state["wrist_pos"] = cur_wrist_pos
+        cur_wrist_rot = side_demo_data["wrist_rot"][torch.arange(self.num_envs), cur_idx]
+        target_state["wrist_quat"] = aa_to_quat(cur_wrist_rot)[:, [1, 2, 3, 0]]
+
+        target_state["wrist_vel"] = side_demo_data["wrist_velocity"][torch.arange(self.num_envs), cur_idx]
+        target_state["wrist_ang_vel"] = side_demo_data["wrist_angular_velocity"][torch.arange(self.num_envs), cur_idx]
+
+        target_state["tips_distance"] = side_demo_data["tips_distance"][torch.arange(self.num_envs), cur_idx]
+
+        cur_joints_pos = side_demo_data["mano_joints"][torch.arange(self.num_envs), cur_idx]
+        target_state["joints_pos"] = cur_joints_pos.reshape(self.num_envs, -1, 3)
+        target_state["joints_vel"] = side_demo_data["mano_joints_velocity"][
+            torch.arange(self.num_envs), cur_idx
+        ].reshape(self.num_envs, -1, 3)
+
+        cur_obj_transf = side_demo_data["obj_trajectory"][torch.arange(self.num_envs), cur_idx]
+        target_state["manip_obj_pos"] = cur_obj_transf[:, :3, 3]
+        target_state["manip_obj_quat"] = rotmat_to_quat(cur_obj_transf[:, :3, :3])[:, [1, 2, 3, 0]]
+
+        target_state["manip_obj_vel"] = side_demo_data["obj_velocity"][torch.arange(self.num_envs), cur_idx]
+        target_state["manip_obj_ang_vel"] = side_demo_data["obj_angular_velocity"][torch.arange(self.num_envs), cur_idx]
+
+        target_state["tip_force"] = torch.stack(
+            [
+                self.net_cf[:, getattr(self, f"dexhand_{side}_handles")[k], :]
+                for k in (self.dexhand_rh.contact_body_names if side == "rh" else self.dexhand_lh.contact_body_names)
+            ],
+            axis=1,
+        )
+        setattr(
+            self,
+            f"{side}_tips_contact_history",
+            torch.concat(
+                [
+                    getattr(self, f"{side}_tips_contact_history")[:, 1:],
+                    (torch.norm(target_state["tip_force"], dim=-1) > 0)[:, None],
+                ],
+                dim=1,
+            ),
+        )
+        target_state["tip_contact_state"] = getattr(self, f"{side}_tips_contact_history")
+
+        side_states = getattr(self, f"{side}_states")
+        target_state["contact_point"] = side_demo_data["contact_point_tips"][torch.arange(self.num_envs), cur_idx]
+        if side == "rh":
+            power = torch.abs(torch.multiply(self.dof_force[:, : self.dexhand_rh.n_dofs], side_states["dq"])).sum(
+                dim=-1
+            )
+        else:
+            power = torch.abs(torch.multiply(self.dof_force[:, self.dexhand_rh.n_dofs :], side_states["dq"])).sum(
+                dim=-1
+            )
+        target_state["power"] = power
+
+        base_handle = getattr(self, f"dexhand_{side}_handles")[
+            self.dexhand_rh.to_dex("wrist")[0] if side == "rh" else self.dexhand_lh.to_dex("wrist")[0]
+        ]
+
+        wrist_power = torch.abs(
+            torch.sum(
+                self.apply_forces[:, base_handle, :] * side_states["base_state"][:, 7:10],
+                dim=-1,
+            )
+        )  # ? linear force * linear velocity
+        wrist_power += torch.abs(
+            torch.sum(
+                self.apply_torque[:, base_handle, :] * side_states["base_state"][:, 10:],
+                dim=-1,
+            )
+        )  # ? torque * angular velocity
+        target_state["wrist_power"] = wrist_power
+
+        if self.training:
+            last_step = self.gym.get_frame_count(self.sim)
+            if self.tighten_method == "None":
+                scale_factor = 1.0
+            elif self.tighten_method == "const":
+                scale_factor = self.tighten_factor
+            elif self.tighten_method == "linear_decay":
+                scale_factor = 1 - (1 - self.tighten_factor) / self.tighten_steps * min(last_step, self.tighten_steps)
+            elif self.tighten_method == "exp_decay":
+                scale_factor = (np.e * 2) ** (-1 * last_step / self.tighten_steps) * (
+                    1 - self.tighten_factor
+                ) + self.tighten_factor
+            elif self.tighten_method == "cos":
+                scale_factor = (self.tighten_factor) + np.abs(
+                    -1 * (1 - self.tighten_factor) * np.cos(last_step / self.tighten_steps * np.pi)
+                ) * (2 ** (-1 * last_step / self.tighten_steps))
+            else:
+                raise NotImplementedError
+        else:
+            scale_factor = 1.0
+
+        # assert not self.headless or isinstance(compute_imitation_reward_tip, torch.jit.ScriptFunction)
+
+        if self.rollout_len is not None:
+            max_length = torch.clamp(max_length, 0, self.rollout_len + self.rollout_begin + 3 + 1)
+
+        rew_buf, reset_buf, success_buf, failure_buf, reward_dict, error_buf = compute_imitation_reward_tip(
             self.reset_buf,
             self.progress_buf,
             self.running_progress_buf,
@@ -2285,12 +2421,14 @@ class DexHandManipBiHEnv(VecTask):
                 print("depth has no finite values")
             self._printed_depth_info = True
 
-        self.save_contacts(
+        self._find_contacts(
             out_dir, step, max_envs=1024,
             object_depth_range=(0.6, 1.2),
             center_crop_ratio=0.6,
             shade="cam_depth"  
         )
+
+        # import ipdb; ipdb.set_trace()
 
         # === Save every 50 steps (adjustable) ===
         step = int(self.gym.get_frame_count(self.sim))
@@ -2836,6 +2974,204 @@ class DexHandManipBiHEnv(VecTask):
             print(f"[contacts/cam] env {env_id}: RH/LH contacts(<{contact_thresh:.3f}m) "
                 f"rh={int(rh_mask.sum().item())}, lh={int(lh_mask.sum().item())})")
 
+    def _find_contacts(self, out_dir: str, step: int, max_envs: int = 1024,
+                                object_depth_range=(0.6, 1.2),
+                                center_crop_ratio=0.6,
+                                shade: str = "cam_depth",
+                                contact_thresh: float = 0.01):
+        import os
+        import torch
+        from PIL import Image
+        os.makedirs(out_dir, exist_ok=True)
+        if self.last_depths is None:
+            return
+
+        # todo: its only works for env_id = 0
+        num = min(len(self.last_depths), max_envs)
+        nan = float('nan') 
+
+        if "joint_pos_tip" not in self.rh_states or self.rh_states["joint_pos_tip"].shape != (num, 5, 3):
+            self.rh_states["joint_pos_tip"] = torch.full((num, 5, 3), nan, device=self.device, dtype=torch.float32)
+        if "joint_pos_tip" not in self.lh_states or self.lh_states["joint_pos_tip"].shape != (num, 5, 3):
+            self.lh_states["joint_pos_tip"] = torch.full((num, 5, 3), nan, device=self.device, dtype=torch.float32)
+        if "contact_point_tip" not in self.rh_states or \
+            self.rh_states["contact_point_tip"].shape != (num, 5, 3):
+                self.rh_states["contact_point_tip"] = torch.full(
+                    (num, 5, 3), nan, device=self.device, dtype=torch.float32
+                )
+        if "contact_point_tip" not in self.lh_states or \
+            self.lh_states["contact_point_tip"].shape != (num, 5, 3):
+                self.lh_states["contact_point_tip"] = torch.full(
+                    (num, 5, 3), nan, device=self.device, dtype=torch.float32
+                )
+
+        buf = self.obs_dict["extra"]  
+        pad = torch.zeros((num, 138), device=buf.device, dtype=buf.dtype)
+
+        for env_id in range(num):
+
+            # ---------- (A) 讀前視相機影像 ----------
+            depth_front = self.last_depths[env_id]
+            if depth_front is None:
+                continue
+            seg_front = self.last_segs[env_id]
+
+            allowed_ids = self._get_allowed_object_ids_for_env(env_id)
+
+            # 由前視相機建立點雲 (在 "front" 相機座標系)
+            pc_cam_front = self._depth_to_pointcloud_from_seg(
+                depth_tensor=depth_front,
+                seg_tensor=seg_front,
+                allowed_ids=allowed_ids,
+                horizontal_fov_deg=69.4,
+                max_points=200_000,
+                border_dilate_px=0,
+                # z_min=0.45,   # 依你相機與桌面的距離微調
+                # z_max=1.30
+            )
+
+            if pc_cam_front is None or pc_cam_front.shape[0] == 0:
+                print(f"[contacts/cam] env {env_id}: no OBJECT point cloud from FRONT (seg empty).")
+                # 就算前視沒點，仍嘗試用 top（但視覺化會比較空）
+                pc_cam_front = None
+
+            # ---------- (B) 讀俯視相機影像 & 轉到前視相機座標 ----------
+            pc_cam_top_in_front = None
+            have_top = (getattr(self, "last_depths_top", None) is not None) and \
+                    (getattr(self, "last_segs_top", None) is not None)
+            if have_top and env_id < len(self.last_depths_top):
+                depth_top = self.last_depths_top[env_id]
+                seg_top   = self.last_segs_top[env_id]
+                if (depth_top is not None) and (seg_top is not None):
+                    # 先在 "top" 相機座標系建立點雲
+                    pc_cam_top = self._depth_to_pointcloud_from_seg(
+                        depth_tensor=depth_top,
+                        seg_tensor=seg_top,
+                        allowed_ids=allowed_ids,
+                        horizontal_fov_deg=69.4,
+                        max_points=200_000,
+                        border_dilate_px=0,
+                        # 俯視通常較遠，放寬 z 範圍（視你的高度調整）
+                        # z_min=0.10,
+                        # z_max=2.00
+                    )
+                    if (pc_cam_top is not None) and (pc_cam_top.shape[0] > 0):
+                        # top(cam) → world → front(cam)
+                        pc_world_from_top   = self._camera_to_world_view(pc_cam_top, env_id, view="top")
+                        pc_cam_top_in_front = self._world_to_camera_view(pc_world_from_top, env_id, view="front")
+
+            # ---------- (C) 合併到「前視相機座標」的點雲 ----------
+            pc_cam_merged = None
+            pcs = []
+            if pc_cam_front is not None and pc_cam_front.shape[0] > 0:
+                pcs.append(pc_cam_front)
+            if pc_cam_top_in_front is not None and pc_cam_top_in_front.shape[0] > 0:
+                pcs.append(pc_cam_top_in_front)
+
+            if len(pcs) == 0:
+                print(f"[contacts/cam] env {env_id}: no OBJECT point cloud from FRONT nor TOP.")
+                # 仍儲存 top 的 RGB 以利排錯
+                if getattr(self, "last_rgb_images_top", None) is not None and env_id < len(self.last_rgb_images_top):
+                    rgb_top = self.last_rgb_images_top[env_id]
+                    _save_single_rgb(rgb_top, os.path.join(out_dir, f"rgb_top_env{env_id:02d}_step{step:06d}.png"))
+                continue
+
+            pc_cam_merged = torch.cat(pcs, dim=0)
+
+            # 避免點太多（可視情況下採）
+            if pc_cam_merged.shape[0] > 200_000:
+                idx = torch.randperm(pc_cam_merged.shape[0], device=pc_cam_merged.device)[:200_000]
+                pc_cam_merged = pc_cam_merged[idx]
+
+            # ---------- (D) joints 轉到「前視相機座標」 ----------
+            # joints world（你的狀態裡本來就有）
+            rh_world_all = self.rh_states["joints_state"][env_id, :, :3]   # [18,3]
+            lh_world_all = self.lh_states["joints_state"][env_id, :, :3]
+            rh_cam_all = self._world_to_camera_view(rh_world_all, env_id, view="front")
+            lh_cam_all = self._world_to_camera_view(lh_world_all, env_id, view="front")
+
+            rh_world_all_tip = self.rh_states["joints_tip_state"][env_id, :, :3]   # [18,3]
+            lh_world_all_tip = self.lh_states["joints_tip_state"][env_id, :, :3]
+            rh_cam_all_tip = self._world_to_camera(rh_world_all_tip, env_id)
+            lh_cam_all_tip = self._world_to_camera(rh_world_all_tip, env_id)
+
+            # 計算接觸只用可動關節（維持你原本作法：丟掉 index 0 的 base）
+            rh_world = rh_world_all[1:, :]
+            lh_world = lh_world_all[1:, :]
+            rh_cam   = self._world_to_camera_view(rh_world, env_id, view="front")
+            lh_cam   = self._world_to_camera_view(lh_world, env_id, view="front")
+
+            rh_world_tip = rh_world_all_tip[1:, :]
+            lh_world_tip = lh_world_all_tip[1:, :]
+            rh_cam_tip = self._world_to_camera_view(rh_world_all_tip, env_id, view="front")
+            lh_cam_tip = self._world_to_camera_view(lh_world_all_tip, env_id, view="front")
+
+            # ---------- (E) 最近鄰接觸（在「前視相機座標」進行」） ----------
+            _, rh_cpts_cam_all, rh_d_all = self._nn_contacts_for_hand_cam(rh_cam, pc_cam_merged)
+            _, lh_cpts_cam_all, lh_d_all = self._nn_contacts_for_hand_cam(lh_cam, pc_cam_merged)
+
+            _, rh_cpts_cam_all_tip, rh_d_all_tip = self._nn_contacts_for_hand_cam(rh_cam_tip, pc_cam_merged)
+            _, lh_cpts_cam_all_tip, lh_d_all_tip = self._nn_contacts_for_hand_cam(lh_cam_tip, pc_cam_merged)
+
+            rh_mask = rh_d_all < contact_thresh
+            lh_mask = lh_d_all < contact_thresh
+            rh_cam_vis = rh_cam[rh_mask]
+            rh_cpts_cam = rh_cpts_cam_all[rh_mask]
+            lh_cam_vis = lh_cam[lh_mask]
+            lh_cpts_cam = lh_cpts_cam_all[lh_mask]
+
+            rh_mask_tip = rh_d_all_tip < contact_thresh
+            lh_mask_tip = lh_d_all_tip < contact_thresh
+            rh_cam_vis_tip = rh_cam_tip[rh_mask_tip]
+            rh_cpts_cam_tip = rh_cpts_cam_all_tip[rh_mask_tip]
+            lh_cam_vis_tip = lh_cam_tip[lh_mask_tip]
+            lh_cpts_cam_tip = lh_cpts_cam_all_tip[lh_mask_tip]
+
+            import torch
+
+            rh_joints = rh_cam_all            
+            lh_joints = lh_cam_all           
+            rh_contacts = torch.zeros_like(rh_joints)  
+            lh_contacts = torch.zeros_like(lh_joints)  
+            rh_contacts[1:][rh_mask] = rh_cpts_cam_all[rh_mask]
+            lh_contacts[1:][lh_mask] = lh_cpts_cam_all[lh_mask]
+
+            # import ipdb; ipdb.set_trace()
+
+            rh_joints_tip = rh_cam_all_tip            
+            lh_joints_tip = lh_cam_all_tip       
+            rh_contacts_tip = torch.full_like(rh_joints_tip, nan)
+            lh_contacts_tip = torch.full_like(rh_joints_tip, nan) 
+            rh_contacts_tip[rh_mask_tip] = rh_cpts_cam_all_tip[rh_mask_tip]
+            lh_contacts_tip[lh_mask_tip] = lh_cpts_cam_all_tip[lh_mask_tip]
+
+            self.rh_states["contact_point_tip"][env_id] = rh_contacts_tip
+            self.lh_states["contact_point_tip"][env_id] = lh_contacts_tip
+            self.rh_states["joint_pos_tip"][env_id] = rh_joints_tip
+            self.lh_states["joint_pos_tip"][env_id] = rh_joints_tip
+
+            # import ipdb; ipdb.set_trace()
+
+
+            vec = torch.cat([
+                lh_joints.reshape(-1),       
+                rh_joints.reshape(-1),       
+                lh_contacts_tip.reshape(-1),     
+                rh_contacts_tip.reshape(-1),     
+            ], dim=0).unsqueeze(0) 
+
+            vec138 = vec.squeeze(0).to(dtype=torch.float32, device=rh_joints.device) 
+            pad[env_id] = vec138.to(buf.dtype)
+
+
+
+            
+
+            # print(f"[contacts/cam] env {env_id}: RH/LH contacts(<{contact_thresh:.3f}m) "
+            #     f"rh={int(rh_mask.sum().item())}, lh={int(lh_mask.sum().item())})")
+
+        self.obs_dict["extra"] = torch.cat([self.obs_dict["extra"], pad], dim=1)
+
 
     def save_contacts(self, out_dir: str, step: int, max_envs: int = 1024,
                                 object_depth_range=(0.6, 1.2),
@@ -2960,6 +3296,8 @@ class DexHandManipBiHEnv(VecTask):
             self.lh_states["contact_point_tip"][env_id] = lh_contacts_tip
             self.rh_states["joint_pos_tip"][env_id] = rh_joints_tip
             self.lh_states["joint_pos_tip"][env_id] = rh_joints_tip
+
+            # import ipdb; ipdb.set_trace()
 
 
             vec = torch.cat([
@@ -3848,7 +4186,7 @@ class DexHandManipBiHEnv(VecTask):
 
     def post_physics_step(self):
         self.compute_observations()
-        self.compute_reward_cp(self.actions)
+        self.compute_reward_tip(self.actions)
 
         self.progress_buf += 1
         self.running_progress_buf += 1
@@ -4272,6 +4610,195 @@ def compute_imitation_reward(
 
     return reward_execute, reset_buf, succeeded, failed_execute, reward_dict, error_buf
 
+# @torch.jit.script
+def compute_imitation_reward_tip(
+    reset_buf: Tensor,
+    progress_buf: Tensor,
+    running_progress_buf: Tensor,
+    actions: Tensor,
+    states: Dict[str, Tensor],
+    target_states: Dict[str, Tensor],
+    max_length: List[int],
+    scale_factor: float,
+    dexhand_weight_idx: Dict[str, List[int]],
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+
+    # type: (Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Dict[str, Tensor], Tensor, float,  Dict[str, List[int]]) -> Tuple[Tensor, Tensor, Tensor, Tensor, Dict[str, Tensor], Tensor]
+
+    # end effector pose reward
+    current_eef_pos = states["base_state"][:, :3]
+    current_eef_quat = states["base_state"][:, 3:7]
+
+    target_eef_pos = target_states["wrist_pos"]
+    target_eef_quat = target_states["wrist_quat"]
+    diff_eef_pos = target_eef_pos - current_eef_pos
+    diff_eef_pos_dist = torch.norm(diff_eef_pos, dim=-1)
+
+    current_eef_vel = states["base_state"][:, 7:10]
+    current_eef_ang_vel = states["base_state"][:, 10:13]
+    target_eef_vel = target_states["wrist_vel"]
+    target_eef_ang_vel = target_states["wrist_ang_vel"]
+
+    diff_eef_vel = target_eef_vel - current_eef_vel
+    diff_eef_ang_vel = target_eef_ang_vel - current_eef_ang_vel
+
+    joints_pos = states["joints_state"][:, 1:, :3]
+    target_joints_pos = target_states["joints_pos"]
+    diff_joints_pos = target_joints_pos - joints_pos
+    diff_joints_pos_dist = torch.norm(diff_joints_pos, dim=-1)
+
+    # contact point reward
+
+    current_joints_pos = states["joints_state"][:, 1:, :3]
+    current_contact_point = states["contact_point_tip"]
+    current_joint_tips_pos = states["joint_pos_tip"]
+    target_contact_point = target_states["contact_point"]
+
+    diff_contact_point = current_contact_point - target_contact_point
+    dis_contact_point = current_joint_tips_pos - target_contact_point
+
+    valid_mask = torch.isfinite(diff_contact_point).all(dim=-1)   
+    target_valid_mask = torch.isfinite(target_contact_point).all(dim=-1)   
+    err = diff_contact_point.abs().mean(dim=-1)                      
+    score_valid = 2.0 * torch.exp(-2 * err)                   
+    penalty_invalid = -0.3
+    nah_reward = 0.0
+    group_reward = torch.where(valid_mask, score_valid, torch.full_like(score_valid, penalty_invalid))
+    final_reward = torch.where(target_valid_mask, group_reward, torch.full_like(group_reward, nah_reward))
+    reward_execute = final_reward.sum(dim=-1)  
+
+    # ? assign different weights to different joints
+    # assert diff_joints_pos_dist.shape[1] == 17  # ignore the base joint
+    diff_thumb_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["thumb_tip"]]].mean(dim=-1)
+    diff_index_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["index_tip"]]].mean(dim=-1)
+    diff_middle_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["middle_tip"]]].mean(dim=-1)
+    diff_ring_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["ring_tip"]]].mean(dim=-1)
+    diff_pinky_tip_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["pinky_tip"]]].mean(dim=-1)
+    diff_level_1_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["level_1_joints"]]].mean(dim=-1)
+    diff_level_2_pos_dist = diff_joints_pos_dist[:, [k - 1 for k in dexhand_weight_idx["level_2_joints"]]].mean(dim=-1)
+
+    joints_vel = states["joints_state"][:, 1:, 7:10]
+    target_joints_vel = target_states["joints_vel"]
+    diff_joints_vel = target_joints_vel - joints_vel
+
+    reward_eef_pos = torch.exp(-40 * diff_eef_pos_dist)
+    reward_thumb_tip_pos = torch.exp(-100 * diff_thumb_tip_pos_dist)
+    reward_index_tip_pos = torch.exp(-90 * diff_index_tip_pos_dist)
+    reward_middle_tip_pos = torch.exp(-80 * diff_middle_tip_pos_dist)
+    reward_pinky_tip_pos = torch.exp(-60 * diff_pinky_tip_pos_dist)
+    reward_ring_tip_pos = torch.exp(-60 * diff_ring_tip_pos_dist)
+    reward_level_1_pos = torch.exp(-50 * diff_level_1_pos_dist)
+    reward_level_2_pos = torch.exp(-40 * diff_level_2_pos_dist)
+
+    reward_eef_vel = torch.exp(-1 * diff_eef_vel.abs().mean(dim=-1))
+    reward_eef_ang_vel = torch.exp(-1 * diff_eef_ang_vel.abs().mean(dim=-1))
+    reward_joints_vel = torch.exp(-1 * diff_joints_vel.abs().mean(dim=-1).mean(-1))
+
+    current_dof_vel = states["dq"]
+
+    diff_eef_rot = quat_mul(target_eef_quat, quat_conjugate(current_eef_quat))
+    diff_eef_rot_angle = quat_to_angle_axis(diff_eef_rot)[0]
+    reward_eef_rot = torch.exp(-1 * (diff_eef_rot_angle).abs())
+
+    # object pose reward
+    current_obj_pos = states["manip_obj_pos"]
+    current_obj_quat = states["manip_obj_quat"]
+
+    target_obj_pos = target_states["manip_obj_pos"]
+    target_obj_quat = target_states["manip_obj_quat"]
+    diff_obj_pos = target_obj_pos - current_obj_pos
+    diff_obj_pos_dist = torch.norm(diff_obj_pos, dim=-1)
+
+    reward_obj_pos = torch.exp(-80 * diff_obj_pos_dist)
+
+    diff_obj_rot = quat_mul(target_obj_quat, quat_conjugate(current_obj_quat))
+    diff_obj_rot_angle = quat_to_angle_axis(diff_obj_rot)[0]
+    reward_obj_rot = torch.exp(-3 * (diff_obj_rot_angle).abs())
+
+    current_obj_vel = states["manip_obj_vel"]
+    target_obj_vel = target_states["manip_obj_vel"]
+    diff_obj_vel = target_obj_vel - current_obj_vel
+    reward_obj_vel = torch.exp(-1 * diff_obj_vel.abs().mean(dim=-1))
+
+    current_obj_ang_vel = states["manip_obj_ang_vel"]
+    target_obj_ang_vel = target_states["manip_obj_ang_vel"]
+    diff_obj_ang_vel = target_obj_ang_vel - current_obj_ang_vel
+    reward_obj_ang_vel = torch.exp(-1 * diff_obj_ang_vel.abs().mean(dim=-1))
+
+    reward_power = torch.exp(-10 * target_states["power"])
+    reward_wrist_power = torch.exp(-2 * target_states["wrist_power"])
+
+    finger_tip_force = target_states["tip_force"]
+    finger_tip_distance = target_states["tips_distance"]
+    contact_range = [0.02, 0.03]
+    finger_tip_weight = torch.clamp(
+        (contact_range[1] - finger_tip_distance) / (contact_range[1] - contact_range[0]), 0, 1
+    )
+    finger_tip_force_masked = finger_tip_force * finger_tip_weight[:, :, None]
+
+    reward_finger_tip_force = torch.exp(-1 * (1 / (torch.norm(finger_tip_force_masked, dim=-1).sum(-1) + 1e-5)))
+
+    error_buf = (
+        (torch.norm(current_eef_vel, dim=-1) > 100)
+        | (torch.norm(current_eef_ang_vel, dim=-1) > 200)
+        | (torch.norm(joints_vel, dim=-1).mean(-1) > 100)
+        | (torch.abs(current_dof_vel).mean(-1) > 200)
+        | (torch.norm(current_obj_vel, dim=-1) > 100)
+        | (torch.norm(current_obj_ang_vel, dim=-1) > 200)
+    )  # sanity check
+
+    failed_execute = (
+        (
+            (diff_obj_pos_dist > 0.02 / 0.343 * scale_factor**3)  # TODO
+            | (diff_thumb_tip_pos_dist > 0.04 / 0.7 * scale_factor)
+            | (diff_index_tip_pos_dist > 0.045 / 0.7 * scale_factor)
+            | (diff_middle_tip_pos_dist > 0.05 / 0.7 * scale_factor)
+            | (diff_pinky_tip_pos_dist > 0.06 / 0.7 * scale_factor)
+            | (diff_ring_tip_pos_dist > 0.06 / 0.7 * scale_factor)
+            | (diff_level_1_pos_dist > 0.07 / 0.7 * scale_factor)
+            | (diff_level_2_pos_dist > 0.08 / 0.7 * scale_factor)
+            | (diff_obj_rot_angle.abs() / np.pi * 180 > 30 / 0.343 * scale_factor**3)  # TODO
+            | torch.any((finger_tip_distance < 0.005) & ~(target_states["tip_contact_state"].any(1)), dim=-1)
+        )
+        & (running_progress_buf >= 8)
+    ) | error_buf
+    
+
+    succeeded = (
+        progress_buf + 1 + 3 >= max_length
+    ) & ~failed_execute  # reached the end of the trajectory, +3 for max future 3 steps
+    reset_buf = torch.where(
+        succeeded | failed_execute,
+        torch.ones_like(reset_buf),
+        reset_buf,
+    )
+    reward_dict = {
+        # "reward_eef_pos": reward_eef_pos,
+        # "reward_eef_rot": reward_eef_rot,
+        # "reward_eef_vel": reward_eef_vel,
+        # "reward_eef_ang_vel": reward_eef_ang_vel,
+        # "reward_joints_vel": reward_joints_vel,
+        # "reward_obj_pos": reward_obj_pos,
+        # "reward_obj_rot": reward_obj_rot,
+        # "reward_obj_vel": reward_obj_vel,
+        # "reward_obj_ang_vel": reward_obj_ang_vel,
+        # "reward_joints_pos": (
+        #     reward_thumb_tip_pos
+        #     + reward_index_tip_pos
+        #     + reward_middle_tip_pos
+        #     + reward_pinky_tip_pos
+        #     + reward_ring_tip_pos
+        #     + reward_level_1_pos
+        #     + reward_level_2_pos
+        # ),
+        # "reward_power": reward_power,
+        # "reward_wrist_power": reward_wrist_power,
+        # "reward_finger_tip_force": reward_finger_tip_force,
+        "reward": reward_execute,
+    }
+
+    return reward_execute, reset_buf, succeeded, failed_execute, reward_dict, error_buf
+
 @torch.jit.script
 def compute_imitation_reward_cp(
     reset_buf: Tensor,
@@ -4308,12 +4835,15 @@ def compute_imitation_reward_cp(
     dis_contact_point = current_joint_tips_pos - target_contact_point
 
     # contact point pos diff reward
-    valid_mask = torch.isfinite(diff_contact_point).all(dim=-1)     
+    valid_mask = torch.isfinite(diff_contact_point).all(dim=-1)   
+    target_valid_mask = torch.isfinite(target_contact_point).all(dim=-1)   
     err = diff_contact_point.abs().mean(dim=-1)                      
     score_valid = 2.0 * torch.exp(-2 * err)                   
     penalty_invalid = -0.3
+    nah_reward = 0.0
     group_reward = torch.where(valid_mask, score_valid, torch.full_like(score_valid, penalty_invalid))
-    reward_execute = group_reward.sum(dim=-1)   
+    final_reward = torch.where(target_valid_mask, group_reward, torch.full_like(group_reward, nah_reward))
+    reward_execute = final_reward.sum(dim=-1)  
 
     
 
@@ -4328,17 +4858,22 @@ def compute_imitation_reward_cp(
 
     # cur joint & contact point diff failure    
     B = dis_contact_point.shape[0]
-    thr_xy = 0.15
-    thr_z  = 0.7
+    thr_x = 0.35
+    thr_y = 1.05
+    thr_z  = 0.65
 
     abs_disp = dis_contact_point.abs()
-    too_far_any = (abs_disp[..., 0] > thr_xy) | (abs_disp[..., 1] > thr_xy) | (abs_disp[..., 2] > thr_z)  
+    
+    too_far_any = (abs_disp[..., 0] > thr_x) | (abs_disp[..., 1] > thr_y) | (abs_disp[..., 2] > thr_z)  
 
     finite_per_finger = torch.isfinite(dis_contact_point).all(dim=-1) 
-    failed_mask = (too_far_any.sum(dim=-1) >= 3)                   
+    finger_finite_count = finite_per_finger.sum(dim=-1)
+    failed_mask = (too_far_any.sum(dim=-1) >= (finite_per_finger.sum(dim=-1) / 2))                   
 
     failed_execute = torch.zeros(B, dtype=torch.bool, device="cuda:0")
     failed_execute.copy_(failed_mask)
+
+    # import ipdb; ipdb.set_trace()
 
 
     succeeded = (
